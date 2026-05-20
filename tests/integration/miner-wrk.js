@@ -2,7 +2,7 @@
 
 const test = require('brittle')
 const fs = require('fs')
-const worker = require('bfx-svc-boot-js/lib/worker')
+const worker = require('@bitfinex/bfx-svc-boot-js/lib/worker')
 const RPC = require('@hyperswarm/rpc')
 const { setTimeout: sleep } = require('timers/promises')
 const { getRandomString, getRandomIP } = require('../utils')

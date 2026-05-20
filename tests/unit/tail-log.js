@@ -3,7 +3,7 @@
 const test = require('brittle')
 const fs = require('fs')
 const { rotateLogs } = require('../../workers/lib/wrk-fun-logs')
-const { createWorker } = require('tether-svc-test-helper').worker
+const { createWorker } = require('@tetherto/tether-svc-test-helper').worker
 
 const storeDir = `${process.cwd()}/store`
 

@@ -2,6 +2,8 @@
 
 const test = require('brittle')
 const WrkProcVar = require('../../workers/rack.thing.wrk')
+const lWrkFunLogs = require('../../workers/lib/wrk-fun-logs')
+const { STAT_RTD } = require('../../workers/lib/constants')
 
 test('WrkProcVar: getThingType', async t => {
   // Create a minimal instance for testing
@@ -332,6 +334,25 @@ function protoWorker (extra = {}) {
   worker.rackId = 'thing-test-rack'
   worker.net_r0 = { rpcServer: { publicKey: Buffer.from([1, 2, 3]) } }
   worker.statTimeframes = [['5m', '0 */5 * * * *']]
+  // Class field: only exists on real instances, not the prototype chain.
+  worker._registerAndStoreThing = async function (data) {
+    data.id = data.id ?? worker._generateThingId()
+    const thgId = data.id
+    const code = data.code ?? worker._generateThingCode(data)
+    const tags = worker._prepThingTags({ ...data, code }, data.tags)
+    const thg = {
+      id: thgId,
+      opts: data.opts,
+      info: data.info,
+      code,
+      tags,
+      comments: data.comments
+    }
+    await worker.registerThingHook0(thg)
+    await worker._storeThingDb(thg)
+    worker.mem.nextAvailableCode = worker._generateThingCode(thg)
+    return thg
+  }
   Object.assign(worker, extra)
   return worker
 }
@@ -1263,4 +1284,582 @@ test('WrkProcVar: _auditLog swallows logger errors to not block rpc', async t =>
 
   w._auditLog('registerThing', { id: 't1' }, { detail: {} })
   t.pass('did not throw')
+})
+
+function patchBeeTimeLog (mockLog) {
+  const origGet = lWrkFunLogs.getBeeTimeLog
+  const origRelease = lWrkFunLogs.releaseBeeTimeLog
+  lWrkFunLogs.getBeeTimeLog = async () => mockLog
+  lWrkFunLogs.releaseBeeTimeLog = async () => {}
+  return () => {
+    lWrkFunLogs.getBeeTimeLog = origGet
+    lWrkFunLogs.releaseBeeTimeLog = origRelease
+  }
+}
+
+async function runCollectSnap (w, thg, thingConf) {
+  await w._collectSnap(thg, thingConf)
+  const deadline = Date.now() + 200
+  while (thg.last.snap === undefined && thg.last.err === undefined && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+test('WrkProcVar: _getAuditDetail covers audit switch cases', async t => {
+  const w = protoWorker()
+  t.alike(w._getAuditDetail('updateThing', { forceOverwrite: true, actionId: 'a1' }), {
+    forceOverwrite: true,
+    actionId: 'a1'
+  })
+  t.alike(w._getAuditDetail('saveThingComment', { thingId: 't1' }), { thingId: 't1' })
+  t.alike(w._getAuditDetail('editThingComment', { thingId: 't1', id: 'c1' }), {
+    thingId: 't1',
+    commentId: 'c1'
+  })
+  t.alike(w._getAuditDetail('deleteThingComment', { thingId: 't1', ts: 99 }), {
+    thingId: 't1',
+    commentId: 99
+  })
+  t.alike(w._getAuditDetail('forgetThings', { query: { id: 't1' }, all: true }), {
+    query: { id: 't1' },
+    all: true
+  })
+  t.alike(w._getAuditDetail('unknownMethod', {}), {})
+})
+
+test('WrkProcVar: _loadOptionalConfigs skips missing configs', async t => {
+  const w = protoWorker()
+  w.loadConf = () => { throw new Error('missing') }
+  w.debug = () => {}
+  w._loadOptionalConfigs()
+  t.pass()
+})
+
+test('WrkProcVar: _storeInfoChangesToDb logs put errors', async t => {
+  const w = protoWorker()
+  w._getInfoHistoryLog = async () => ({
+    get: async () => null,
+    put: async () => { throw new Error('put fail') },
+    discoveryKey: Buffer.alloc(32)
+  })
+  w.debugError = () => {}
+  await w._storeInfoChangesToDb({ info: { a: 1 } }, { id: 't1', info: { a: 2 } })
+  t.pass()
+})
+
+test('WrkProcVar: updateThingHook0 swallows store errors', async t => {
+  const w = protoWorker()
+  w._storeInfoChangesToDb = async () => { throw new Error('db fail') }
+  w.debugError = () => {}
+  await w.updateThingHook0({ id: 't1', info: {} }, { id: 't1', info: {} })
+  t.pass()
+})
+
+test('WrkProcVar: _collectSnap skips when already collecting', async t => {
+  const w = protoWorker()
+  w.mem.collectingThingSnap = { t1: { isCollectingSnap: true } }
+  let called = false
+  w.collectThingSnap = async () => { called = true }
+  await w._collectSnap({ id: 't1', last: {} }, w.conf.thing)
+  t.is(called, false)
+})
+
+test('WrkProcVar: _collectSnap maintenance mode uses offline snap', async t => {
+  const w = protoWorker({
+    conf: { thing: { storeSnapItvMs: 0, collectSnapRetry: 1, collectSnapTimeoutMs: 5000 } }
+  })
+  w.loadLib = () => null
+  w._storeThingSnap = async () => {}
+  const thg = { id: 't1', info: { container: 'maintenance' }, last: {} }
+  await runCollectSnap(w, thg, w.conf.thing)
+  t.is(thg.last.snap.success, false)
+  t.is(thg.last.snap.stats.status, 'offline')
+})
+
+test('WrkProcVar: _collectSnap collects from ctrl', async t => {
+  const snap = { success: true, stats: { status: 'ok' } }
+  const origCollect = WrkProcVar.prototype.collectThingSnap
+  WrkProcVar.prototype.collectThingSnap = async () => snap
+  try {
+    const w = protoWorker({
+      conf: { thing: { storeSnapItvMs: 0, collectSnapRetry: 1, collectSnapTimeoutMs: 5000 } }
+    })
+    w.loadLib = () => null
+    w._storeThingSnap = async () => {}
+    const thg = { id: 't1', info: {}, last: {}, ctrl: {} }
+    await runCollectSnap(w, thg, w.conf.thing)
+    t.is(thg.last.snap, snap)
+  } finally {
+    WrkProcVar.prototype.collectThingSnap = origCollect
+  }
+})
+
+test('WrkProcVar: _collectSnap timeout uses offline snap', async t => {
+  const origCollect = WrkProcVar.prototype.collectThingSnap
+  WrkProcVar.prototype.collectThingSnap = async () => {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    return { success: true, stats: {} }
+  }
+  try {
+    const w = protoWorker({
+      conf: { thing: { storeSnapItvMs: 0, collectSnapRetry: 1, collectSnapTimeoutMs: 5 } }
+    })
+    w.loadLib = () => null
+    w._storeThingSnap = async () => {}
+    const thg = { id: 't1', info: {}, last: {}, ctrl: {} }
+    await runCollectSnap(w, thg, w.conf.thing)
+    t.is(thg.last.snap.success, false)
+  } finally {
+    WrkProcVar.prototype.collectThingSnap = origCollect
+  }
+})
+
+test('WrkProcVar: _collectSnap connection failure when no ctrl', async t => {
+  const w = protoWorker({
+    conf: { thing: { storeSnapItvMs: 0, collectSnapRetry: 1, collectSnapTimeoutMs: 5000 } }
+  })
+  w.connectThing = async () => {}
+  w.loadLib = () => null
+  w._storeThingSnap = async () => {}
+  const thg = { id: 't1', info: {}, last: {} }
+  await runCollectSnap(w, thg, w.conf.thing)
+  t.is(thg.last.err, 'ERR_THING_CONNECTION_FAILURE')
+})
+
+test('WrkProcVar: _collectSnap records non-timeout collect errors', async t => {
+  const origCollect = WrkProcVar.prototype.collectThingSnap
+  WrkProcVar.prototype.collectThingSnap = async () => { throw new Error('ERR_DEVICE') }
+  try {
+    const w = protoWorker({
+      conf: { thing: { storeSnapItvMs: 0, collectSnapRetry: 1, collectSnapTimeoutMs: 5000 } }
+    })
+    w.loadLib = () => null
+    w._storeThingSnap = async () => {}
+    w.debugThingError = () => {}
+    const thg = { id: 't1', info: {}, last: {}, ctrl: {} }
+    await runCollectSnap(w, thg, w.conf.thing)
+    t.is(thg.last.err, 'ERR_DEVICE')
+  } finally {
+    WrkProcVar.prototype.collectThingSnap = origCollect
+  }
+})
+
+test('WrkProcVar: collectSnaps runs hooks and saves alerts', async t => {
+  const w = protoWorker()
+  let hookCalled = false
+  let alertsSaved = false
+  w.mem.things = { t1: { id: 't1', last: { alerts: [] } } }
+  w._collectSnap = async () => {}
+  w.collectSnapsHook0 = async () => { hookCalled = true }
+  w._saveAlerts = async () => { alertsSaved = true }
+  await w.collectSnaps()
+  t.ok(hookCalled)
+  t.ok(alertsSaved)
+})
+
+test('WrkProcVar: collectSnaps logs alert save errors', async t => {
+  const w = protoWorker()
+  w.mem.things = { t1: { id: 't1' } }
+  w._collectSnap = async () => {}
+  w.collectSnapsHook0 = async () => {}
+  w._saveAlerts = async () => { throw new Error('save fail') }
+  w.debugError = () => {}
+  await w.collectSnaps()
+  t.pass()
+})
+
+test('WrkProcVar: setupThing loads last snap from log on master', async t => {
+  const restore = patchBeeTimeLog({
+    peek: async () => ({
+      value: Buffer.from(JSON.stringify({ snap: { ok: 1 }, ts: 1, err: null }))
+    }),
+    discoveryKey: Buffer.alloc(32)
+  })
+  try {
+    const w = protoWorker()
+    w.ctx.slave = false
+    w.setupThingHook0 = async () => {}
+    w.setupThingHook1 = async () => {}
+    w.connectThing = async (thg) => { thg.ctrl = {} }
+    const r = await w.setupThing({
+      id: 't-new',
+      code: 'THING-0010',
+      tags: [],
+      info: {},
+      opts: {},
+      comments: []
+    })
+    t.is(r, 1)
+    t.is(w.mem.things['t-new'].last.snap.ok, 1)
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: setupThings forgets stale things and assigns codes', async t => {
+  const w = protoWorker()
+  w.mem.things = { stale: { id: 'stale' } }
+  w.things = {
+    createReadStream () {
+      return (async function * () {
+        yield {
+          value: Buffer.from(JSON.stringify({
+            id: 'fresh',
+            code: 'THING-0002',
+            tags: [],
+            info: {},
+            opts: {}
+          }))
+        }
+      })()
+    }
+  }
+  w.setupThing = async (entry) => {
+    w.mem.things[entry.id] = { id: entry.id, code: entry.code, tags: entry.tags }
+    return 1
+  }
+  w._forgetThing = async (id) => { delete w.mem.things[id] }
+  w._assignCodesToThings = async () => {}
+  await w.setupThings()
+  t.absent(w.mem.things.stale)
+  t.ok(w.mem.things.fresh)
+})
+
+test('WrkProcVar: setupThings logs setup and assign errors', async t => {
+  const w = protoWorker()
+  w.things = {
+    createReadStream () {
+      return (async function * () {
+        yield { value: Buffer.from(JSON.stringify({ id: 'bad' })) }
+      })()
+    }
+  }
+  w.setupThing = async () => { throw new Error('setup fail') }
+  w._assignCodesToThings = async () => { throw new Error('assign fail') }
+  w.debugError = () => {}
+  await w.setupThings()
+  t.pass()
+})
+
+test('WrkProcVar: _assignCodesToThings assigns codes to uncoded things', async t => {
+  const w = protoWorker()
+  w.mem.things = {
+    t1: { id: 't1', tags: [] },
+    t2: { id: 't2', tags: [] }
+  }
+  w.things = {
+    put: async () => {},
+    get: async (id) => ({
+      value: Buffer.from(JSON.stringify(w.mem.things[id]))
+    })
+  }
+  await w._assignCodesToThings()
+  t.ok(w.mem.things.t1.code)
+  t.ok(w.mem.things.t2.code)
+  t.ok(w.mem.nextAvailableCode)
+})
+
+test('WrkProcVar: _assignCodesToThings sets next code when all coded', async t => {
+  const w = protoWorker()
+  w.mem.things = { t1: { id: 't1', code: 'THING-0007', tags: [] } }
+  await w._assignCodesToThings()
+  t.ok(w.mem.nextAvailableCode.startsWith('THING-'))
+})
+
+test('WrkProcVar: registerThing with comment and info', async t => {
+  const restore = patchBeeTimeLog({
+    peek: async () => null,
+    discoveryKey: Buffer.alloc(32)
+  })
+  try {
+    const w = protoWorker()
+    w.ctx.slave = false
+    w.mem.things = {}
+    let stored
+    w.things = {
+      put: async (id, buf) => { stored = JSON.parse(buf.toString()) }
+    }
+    w.registerThingHook0 = async () => {}
+    w.connectThing = async (thg) => { thg.ctrl = {} }
+    await w.registerThing({
+      opts: { host: 'miner-1' },
+      info: { rack: 'r1' },
+      comment: 'installed',
+      user: 'tech'
+    })
+    t.ok(stored)
+    t.is(stored.comments.length, 1)
+    t.is(stored.comments[0].user, 'tech')
+    t.is(Object.keys(w.mem.things).length, 1)
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: updateThing assigns code and merges fields', async t => {
+  const w = protoWorker()
+  w.ctx.slave = false
+  w.mem.things = { t1: { id: 't1' } }
+  let stored = {
+    id: 't1',
+    opts: { a: 1 },
+    info: { n: 1 },
+    tags: ['id-t1'],
+    comments: null
+  }
+  w.things = {
+    get: async () => ({ value: Buffer.from(JSON.stringify(stored)) }),
+    put: async (_id, buf) => { stored = JSON.parse(buf.toString()) }
+  }
+  w.updateThingHook0 = async () => {}
+  w.reconnectThing = async () => {}
+  await w.updateThing({
+    id: 't1',
+    opts: { b: 2 },
+    info: { n: 2, extra: true },
+    tags: ['aux-x'],
+    comment: 'updated',
+    user: 'u1',
+    actionId: 'act-1'
+  })
+  t.ok(stored.code)
+  t.ok(Array.isArray(stored.comments))
+  t.is(stored.comments.length, 1)
+  t.is(stored.info.n, 2)
+})
+
+test('WrkProcVar: _forgetThing closes ctrl and removes thing', async t => {
+  const w = protoWorker()
+  let closed = false
+  w.mem.things = {
+    t1: { id: 't1', ctrl: { close: async () => { closed = true; throw new Error('close err') } } }
+  }
+  w.things = { del: async () => {} }
+  w.forgetThingHook0 = async () => {}
+  await w._forgetThing('t1')
+  t.ok(closed)
+  t.absent(w.mem.things.t1)
+})
+
+test('WrkProcVar: applyThings skips non-matching things', async t => {
+  const w = protoWorker()
+  w._handler = WrkProcVar.prototype._createApplyThingsProxy.call(w)
+  w.mem.things = {
+    t1: { id: 't1', ctrl: { ping: async () => 1 } },
+    t2: { id: 't2', ctrl: { ping: async () => 1 } }
+  }
+  const n = await w.applyThings({ method: 'ping', query: { id: 't1' }, params: [] })
+  t.is(n, 1)
+})
+
+test('WrkProcVar: applyThings counts zero when handler throws', async t => {
+  const w = protoWorker()
+  w._handler = WrkProcVar.prototype._createApplyThingsProxy.call(w)
+  w.mem.things = { t1: { id: 't1', ctrl: {} } }
+  w.debugThingError = () => {}
+  const n = await w.applyThings({ method: 'missingMethod', query: { id: 't1' } })
+  t.is(n, 0)
+})
+
+test('WrkProcVar: applyThings proxy routes ThingLocApply methods', async t => {
+  const w = protoWorker()
+  w.rebootThingLocApply = async (thg) => {
+    t.is(thg.id, 't1')
+    return 1
+  }
+  w._handler = WrkProcVar.prototype._createApplyThingsProxy.call(w)
+  const res = await w._handler.call(
+    { method: 'rebootThingLocApply', params: [] },
+    { id: 't1' }
+  )
+  t.is(res, 1)
+})
+
+test('WrkProcVar: _saveAlerts stores thing alerts', async t => {
+  const restore = patchBeeTimeLog({
+    put: async () => {},
+    get: async () => null,
+    discoveryKey: Buffer.alloc(32)
+  })
+  try {
+    const w = protoWorker()
+    w.mem.things = {
+      t1: {
+        id: 't1',
+        last: {
+          alerts: [{ createdAt: 1000, uuid: 'u1', name: 'heat', code: 'H1' }]
+        }
+      }
+    }
+    await w._saveAlerts()
+    t.pass()
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: _storeThgAlertsToDb merges existing alerts', async t => {
+  const w = protoWorker()
+  const log = {
+    get: async () => ({
+      value: Buffer.from(JSON.stringify({ old: { thingId: 't1', uuid: 'old' } }))
+    }),
+    put: async () => {}
+  }
+  await w._storeThgAlertsToDb('t1', log, [
+    { createdAt: 1000, uuid: 'u1', name: 'heat', code: 'H1' }
+  ])
+  t.pass()
+})
+
+test('WrkProcVar: _storeThgAlertsToDb ignores non-array alerts', async t => {
+  const w = protoWorker()
+  await w._storeThgAlertsToDb('t1', {}, null)
+  t.pass()
+})
+
+test('WrkProcVar: _getLogs throws when parse result is not array', async t => {
+  const w = protoWorker()
+  const restore = patchBeeTimeLog({
+    discoveryKey: Buffer.alloc(32),
+    createReadStream () {
+      return (async function * () {})()
+    }
+  })
+  try {
+    w._parseHistLog = async () => 'not-array'
+    try {
+      await w._getLogs({}, 'log-key', 'ERR_LOG', (x) => x)
+      t.fail()
+    } catch (e) {
+      t.is(e.message, 'ERR_HIST_LOG_NOTFOUND')
+    }
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: _getLogResponse throws when log missing', async t => {
+  const restore = patchBeeTimeLog(null)
+  try {
+    const w = protoWorker()
+    try {
+      await w._getLogResponse({ key: 'stat', tag: 't1' }, 0)
+      t.fail()
+    } catch (e) {
+      t.is(e.message, 'ERR_LOG_NOTFOUND')
+    }
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: getHistoricalLogs info applies filters', async t => {
+  const w = protoWorker()
+  w.mem.things = {
+    t1: { id: 't1', info: { n: 1 }, tags: [], type: 'thing', code: 'C1' },
+    t2: { id: 't2', info: { n: 2 }, tags: [], type: 'thing', code: 'C2' }
+  }
+  w._getLogs = async (req, logKey, errMsg, transformFn) => {
+    return transformFn([
+      [{ id: 't1', changes: {}, ts: 1 }],
+      [{ id: 't2', changes: {}, ts: 2 }]
+    ], req)
+  }
+  const out = await w.getHistoricalLogs({
+    logType: 'info',
+    limit: 1,
+    offset: 0,
+    query: { 'thing.id': 't1' }
+  })
+  t.is(out.length, 1)
+  t.is(out[0].thing.id, 't1')
+})
+
+test('WrkProcVar: buildStats routes stat-rtd to _saveRealTimeData', async t => {
+  const w = protoWorker()
+  let called = false
+  w._saveRealTimeData = async () => { called = true }
+  await w.buildStats(STAT_RTD, Date.now())
+  t.ok(called)
+})
+
+test('WrkProcVar: _saveRealTimeData aggregates realtime snapshots', async t => {
+  const restore = patchBeeTimeLog({
+    put: async () => {},
+    discoveryKey: Buffer.alloc(32)
+  })
+  try {
+    const w = protoWorker({
+      conf: { thing: { thingRtdConcurrency: 2 } }
+    })
+    w._getThingBaseType = () => 'thing'
+    w.loadLib = () => null
+    w.debugThingError = () => {}
+    w.mem.things = {
+      t1: {
+        id: 't1',
+        ctrl: { getRealtimeData: async () => ({ success: true, stats: { h: 1 } }) }
+      },
+      t2: { id: 't2' },
+      t3: {
+        id: 't3',
+        ctrl: { getRealtimeData: async () => { throw new Error('rtd fail') } }
+      }
+    }
+    await w._saveRealTimeData()
+    await new Promise(resolve => setTimeout(resolve, 50))
+    t.is(w._collectingRtd, false)
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: _saveRealTimeData skips when already collecting', async t => {
+  const w = protoWorker()
+  w._collectingRtd = true
+  w.mem.things = {
+    t1: { id: 't1', ctrl: { getRealtimeData: async () => ({}) } }
+  }
+  await w._saveRealTimeData()
+  t.pass()
+})
+
+test('WrkProcVar: getDbMeta lists main and log cores', async t => {
+  const restore = patchBeeTimeLog({
+    core: { key: Buffer.from('aa', 'hex') },
+    discoveryKey: Buffer.alloc(32)
+  })
+  try {
+    const w = protoWorker({
+      db: { core: { key: Buffer.from('bb', 'hex') } },
+      meta_logs: {
+        createReadStream () {
+          return (async function * () {
+            yield {
+              key: 'thing-alerts',
+              value: Buffer.from(JSON.stringify({ cur: 0 }))
+            }
+          })()
+        }
+      }
+    })
+    const keys = await w.getDbMeta()
+    t.ok(keys.length >= 2)
+    t.is(keys[0].name, 'main')
+  } finally {
+    restore()
+  }
+})
+
+test('WrkProcVar: rackReboot stops worker', async t => {
+  const w = protoWorker()
+  let stopped = false
+  w.stop = (cb) => {
+    stopped = true
+    // Do not invoke cb — production cb calls process.exit(-1).
+  }
+  const r = w.rackReboot({})
+  t.is(r, 1)
+  t.ok(stopped)
 })
