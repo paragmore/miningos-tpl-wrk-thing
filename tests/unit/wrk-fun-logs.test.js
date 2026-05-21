@@ -462,6 +462,71 @@ test('lib:wrk-fun-logs', async (main) => {
     }
   })
 
+  await main.test('getBeeTimeLog: slave resolves log via replica key', async (t) => {
+    const logName = getLogName()
+    await addTestKeys(logName, 3)
+    const masterLog = await getLog(logName, 0)
+    const repKey = masterLog.core.key.toString('hex')
+    await releaseBeeTimeLog.call(thingWorker, masterLog)
+
+    const slaveWorker = {
+      ...thingWorker,
+      ctx: { slave: true },
+      mem: {
+        replica_conf: {
+          metaDiscoveryKeys: {
+            [`${logName}-0`]: repKey
+          }
+        }
+      }
+    }
+
+    const log = await getBeeTimeLog.call(slaveWorker, logName, 0)
+    t.ok(log)
+    await releaseBeeTimeLog.call(slaveWorker, log)
+  })
+
+  await main.test('getBeeTimeLog: rotates corrupted log at offset 0', async (t) => {
+    const logName = getLogName()
+    await addTestKeys(logName, 3)
+    const log = await getLog(logName, 0)
+    const origStream = log.createReadStream.bind(log)
+    log.createReadStream = () => {
+      throw new Error('corrupt read')
+    }
+
+    const rotated = await getBeeTimeLog.call(thingWorker, logName, 0)
+    t.ok(rotated)
+    log.createReadStream = origStream
+    await releaseBeeTimeLog.call(thingWorker, rotated)
+  })
+
+  await main.test('getBeeTimeLog: returns null when log.ready fails', async (t) => {
+    const logName = getLogName()
+    await thingWorker.meta_logs.put(
+      logName,
+      Buffer.from(JSON.stringify({ cur: 0 }))
+    )
+    const badLog = await thingWorker.store_s1.getBee(
+      { name: `${logName}-5-0` },
+      { keyEncoding: 'binary' }
+    )
+    badLog.ready = async () => {
+      throw new Error('ready failed')
+    }
+
+    const origGetBee = thingWorker.store_s1.getBee.bind(thingWorker.store_s1)
+    thingWorker.store_s1.getBee = async (opts) => {
+      if (opts.name === `${logName}-5-0`) return badLog
+      return origGetBee(opts)
+    }
+
+    const log = await getBeeTimeLog.call(thingWorker, logName, 0)
+    t.is(log, null)
+    thingWorker.store_s1.getBee = origGetBee
+    await thingWorker.meta_logs.del(logName)
+  })
+
   await main.test('refreshLogsCache: should handle errors during cleanup gracefully', async (t) => {
     const logName = getLogName()
     await addTestKeys(logName, logRotateMaxLength)

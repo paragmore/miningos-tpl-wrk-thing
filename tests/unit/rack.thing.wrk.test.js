@@ -1,9 +1,11 @@
 'use strict'
 
 const test = require('brittle')
+const TetherWrkBase = require('@tetherto/tether-wrk-base/workers/base.wrk.tether')
 const WrkProcVar = require('../../workers/rack.thing.wrk')
 const lWrkFunLogs = require('../../workers/lib/wrk-fun-logs')
-const { STAT_RTD } = require('../../workers/lib/constants')
+const lWrkFunReplica = require('../../workers/lib/wrk-fun-replica')
+const { STAT_RTD, RPC_METHODS } = require('../../workers/lib/constants')
 
 test('WrkProcVar: getThingType', async t => {
   // Create a minimal instance for testing
@@ -1862,4 +1864,202 @@ test('WrkProcVar: rackReboot stops worker', async t => {
   const r = w.rackReboot({})
   t.is(r, 1)
   t.ok(stopped)
+})
+
+function createMockDb () {
+  const sub = {
+    get: async () => null,
+    put: async () => {},
+    del: async () => {},
+    createReadStream () {
+      return (async function * () {})()
+    }
+  }
+  return {
+    ready: async () => {},
+    core: { key: Buffer.from('aabbccdd', 'hex') },
+    sub: () => sub
+  }
+}
+
+function buildStartWorker (extra = {}) {
+  const db = createMockDb()
+  const intervalAdds = []
+  const schedulerAdds = []
+  const rpcHandlers = {}
+  const w = protoWorker({
+    ctx: { rack: 'test-rack', slave: false, root: process.cwd() },
+    conf: {
+      thing: {
+        scheduleAddlStatTfs: [['1h', '0 0 */1 * * *']],
+        scheduleAddlStatConfigTfs: [['2h', '0 0 */2 * * *']],
+        replicaDiscoveryKey: 'disc-key',
+        collectSnapsItvMs: 1000,
+        rotateLogsItvMs: 2000,
+        refreshLogsCacheItvMs: 3000
+      },
+      globalConfig: { site: 'test' }
+    },
+    status: {},
+    saveStatus () {},
+    net_r0: {
+      startRpcServer: async () => {},
+      rpcServer: {
+        respond (name, handler) {
+          rpcHandlers[name] = handler
+        },
+        publicKey: Buffer.alloc(32, 1)
+      },
+      handleReply: async (method, req) => ({ method, req }),
+      parseInputJSON: (req) => req,
+      toOutJSON: (res) => res,
+      dht: { defaultKeyPair: { publicKey: Buffer.alloc(32, 2) } }
+    },
+    store_s1: {
+      getBee: async () => db,
+      store: { primaryKey: Buffer.alloc(32, 3) }
+    },
+    interval_0: {
+      add (name, fn, ms) {
+        intervalAdds.push({ name, ms })
+      }
+    },
+    scheduler_0: {
+      add (name, fn, cron) {
+        schedulerAdds.push({ name, cron })
+      }
+    },
+    miningosThgWriteCalls_0: {
+      bindWriteCalls () {},
+      whitelistActions () {}
+    },
+    setupThings: async () => 1,
+    ...extra
+  })
+  return { w, db, intervalAdds, schedulerAdds, rpcHandlers }
+}
+
+async function runStart (w, { onStartReplica } = {}) {
+  const origParentStart = TetherWrkBase.prototype._start
+  const origStartReplica = lWrkFunReplica.startReplica
+  TetherWrkBase.prototype._start = function (cb) {
+    cb()
+  }
+  lWrkFunReplica.startReplica = function () {
+    if (onStartReplica) onStartReplica()
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      w._start(err => (err ? reject(err) : resolve()))
+    })
+  } finally {
+    TetherWrkBase.prototype._start = origParentStart
+    lWrkFunReplica.startReplica = origStartReplica
+  }
+}
+
+test('WrkProcVar: _start master wires rpc db intervals and replica', async t => {
+  const replicaStarted = []
+  const { w, intervalAdds, schedulerAdds, rpcHandlers } = buildStartWorker()
+
+  await runStart(w, {
+    onStartReplica: () => replicaStarted.push(1)
+  })
+
+  t.ok(rpcHandlers.echo)
+  t.ok(rpcHandlers.registerThing)
+  t.is(RPC_METHODS.every(m => rpcHandlers[m]), true)
+  t.ok(w.db)
+  t.ok(w.things)
+  t.ok(w.meta_logs)
+  t.ok(w.settings)
+  t.is(w.status.rpcPublicKey, w.getRpcKey().toString('hex'))
+  t.ok(intervalAdds.some(a => a.name === 'collectSnaps'))
+  t.ok(intervalAdds.some(a => a.name === 'rotateLogs'))
+  t.ok(intervalAdds.some(a => a.name === 'refreshLogsCache'))
+  t.absent(intervalAdds.find(a => a.name === 'setupThings'))
+  t.ok(schedulerAdds.length >= 1)
+  t.is(replicaStarted.length, 1)
+})
+
+test('WrkProcVar: _start slave uses replica db and slave intervals', async t => {
+  const repKey = 'cc'.repeat(32)
+  const { w, intervalAdds } = buildStartWorker({
+    ctx: { rack: 'test-rack', slave: true, root: process.cwd() },
+    status: {
+      replica_conf: {
+        metaDiscoveryKeys: { 'main-0': repKey }
+      }
+    },
+    conf: {
+      thing: {
+        refreshThingsItvMs: 60000,
+        refreshReplicaConfItvMs: 30000,
+        refreshLogsCacheItvMs: 45000
+      }
+    },
+    store_s1: {
+      getBee: async (opts) => {
+        t.is(opts.key.toString('hex'), repKey)
+        return createMockDb()
+      },
+      store: { primaryKey: Buffer.alloc(32, 3) }
+    }
+  })
+
+  await runStart(w)
+
+  t.ok(intervalAdds.some(a => a.name === 'setupThings'))
+  t.ok(intervalAdds.some(a => a.name === 'refreshReplicaConf'))
+  t.absent(intervalAdds.find(a => a.name === 'collectSnaps'))
+  t.absent(intervalAdds.find(a => a.name === 'refreshLogsCache'))
+})
+
+test('WrkProcVar: _start slave refreshes replica conf when missing', async t => {
+  const { w } = buildStartWorker({
+    ctx: { rack: 'test-rack', slave: true, root: process.cwd() },
+    status: {},
+    conf: { thing: {} }
+  })
+  const origRefresh = lWrkFunReplica.refreshReplicaConf
+  lWrkFunReplica.refreshReplicaConf = async function () {
+    this.mem.replica_conf = { metaDiscoveryKeys: { 'main-0': 'dd'.repeat(32) } }
+  }
+
+  try {
+    await runStart(w)
+    t.ok(w.mem.replica_conf)
+  } finally {
+    lWrkFunReplica.refreshReplicaConf = origRefresh
+  }
+})
+
+test('WrkProcVar: _start slave throws when replica conf unavailable', async t => {
+  const { w } = buildStartWorker({
+    ctx: { rack: 'test-rack', slave: true, root: process.cwd() },
+    status: {},
+    conf: { thing: {} }
+  })
+  const origRefresh = lWrkFunReplica.refreshReplicaConf
+  lWrkFunReplica.refreshReplicaConf = async () => {}
+
+  try {
+    await t.exception(async () => runStart(w), /ERR_REPLICA_FAILED/)
+  } finally {
+    lWrkFunReplica.refreshReplicaConf = origRefresh
+  }
+})
+
+test('WrkProcVar: _start audit rpc handler delegates to handleRpcReply', async t => {
+  const { w, rpcHandlers } = buildStartWorker()
+  let audited = false
+  w.handleRpcReply = async (method, req) => {
+    audited = true
+    t.is(method, 'registerThing')
+    return 1
+  }
+
+  await runStart(w)
+  await rpcHandlers.registerThing({ id: 't1', opts: { host: 'h' } })
+  t.ok(audited)
 })

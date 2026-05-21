@@ -80,6 +80,24 @@ test('getLogsCountForTimeRange: hour-style cron uses hour interval', async t => 
   t.ok(result >= 3)
 })
 
+test('getLogsCountForTimeRange: daily cron and unsupported cron return 0', async t => {
+  const daily = getLogsCountForTimeRange(
+    0,
+    48 * 60 * 60 * 1000,
+    'stat-1D',
+    [['1D', '0 0 0 * * *']]
+  )
+  t.ok(daily >= 2)
+
+  const bad = getLogsCountForTimeRange(
+    0,
+    1000,
+    'stat-bad',
+    [['bad', 'invalid cron']]
+  )
+  t.is(bad, 0)
+})
+
 test('isValidSnap and isOffline', async t => {
   t.ok(isValidSnap({ stats: { a: 1 }, config: { b: 2 } }))
   t.absent(isValidSnap({ stats: {} }))
@@ -125,6 +143,17 @@ test('aggregateLogs: nested non-numeric fields keep first value', async t => {
   const out = aggregateLogs(logs, '1D', false)
   t.ok(out.length >= 1)
   t.is(out[0].m.label, 'alpha')
+})
+
+test('aggregateLogs: string field keeps first value in bucket', async t => {
+  const ts = 1_700_000_000_000
+  const logs = [
+    { ts, mode: 'a' },
+    { ts: ts + 500, mode: 'b' }
+  ]
+  const out = aggregateLogs(logs, '1D', false)
+  t.ok(out.length >= 1)
+  t.is(out[0].mode, 'a')
 })
 
 test('aggregateLogs: invalid group range throws', async t => {
