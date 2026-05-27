@@ -3,7 +3,7 @@ const gLibStats = require('@tetherto/miningos-lib-stats')
 const lWrkFunLogs = require('./wrk-fun-logs')
 
 function aggrStats (thgIds, opts = {}, thgs = null) {
-  const acc = {}
+  const result = {}
   const lLibStats = this.loadLib('stats')
   const specs = lLibStats.specs
 
@@ -14,6 +14,7 @@ function aggrStats (thgIds, opts = {}, thgs = null) {
 
     const state = {}
     state.ops = specs[stype].ops
+    const acc = {}
 
     for (const thgId of thgIds) {
       const thg = thgs?.[thgId] || this.mem.things[thgId]
@@ -29,9 +30,10 @@ function aggrStats (thgIds, opts = {}, thgs = null) {
     }
 
     gLibStats.tallyStats(state, acc)
+    Object.assign(result, acc)
   })
 
-  return acc
+  return result
 }
 
 async function _buildStats (logKey, fireTime) {
