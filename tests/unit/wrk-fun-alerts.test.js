@@ -281,3 +281,156 @@ test('wrk-fun-alerts: valid false skips probe', async t => {
   const result = processThingAlerts.call(mockWorker, thing)
   t.is(result, null)
 })
+
+test('wrk-fun-alerts: array probe result raises one alert per match with message', async t => {
+  const mockWorker = {
+    loadLib: () => ({
+      specs: {
+        miner: {
+          tag_warning: {
+            valid: () => true,
+            probe: () => ['TAG-A', 'TAG-B']
+          }
+        }
+      }
+    }),
+    conf: {
+      thing: {
+        alerts: {
+          miner: {
+            tag_warning: { description: 'Tag warning', severity: 'warning' }
+          }
+        }
+      }
+    },
+    getSpecTags: () => ['miner']
+  }
+  const thing = {
+    type: 'miner',
+    last: { snap: { success: true } },
+    info: {},
+    id: 'id1'
+  }
+  const result = processThingAlerts.call(mockWorker, thing)
+
+  t.ok(Array.isArray(result))
+  t.is(result.length, 2, 'one alert per breaching tag')
+  t.alike(result.map(a => a.message), ['TAG-A', 'TAG-B'], 'device tag carried in message')
+  t.ok(result.every(a => a.name === 'tag_warning' && a.severity === 'warning' && a.description === 'Tag warning'))
+})
+
+test('wrk-fun-alerts: empty array probe result raises no alert', async t => {
+  const mockWorker = {
+    loadLib: () => ({
+      specs: {
+        miner: {
+          tag_warning: {
+            valid: () => true,
+            probe: () => []
+          }
+        }
+      }
+    }),
+    conf: {
+      thing: {
+        alerts: {
+          miner: { tag_warning: { description: 'Tag warning', severity: 'warning' } }
+        }
+      }
+    },
+    getSpecTags: () => ['miner']
+  }
+  const thing = {
+    type: 'miner',
+    last: { snap: { success: true } },
+    info: {},
+    id: 'id1'
+  }
+  const result = processThingAlerts.call(mockWorker, thing)
+  t.is(result, null, 'empty array means no breach')
+})
+
+test('wrk-fun-alerts: object match supports per-alert description override', async t => {
+  const mockWorker = {
+    loadLib: () => ({
+      specs: {
+        miner: {
+          tag_warning: {
+            valid: () => true,
+            probe: () => [
+              { message: 'TAG-A', description: 'detailed A' },
+              { message: 'TAG-B' }
+            ]
+          }
+        }
+      }
+    }),
+    conf: {
+      thing: {
+        alerts: {
+          miner: { tag_warning: { description: 'base description', severity: 'warning' } }
+        }
+      }
+    },
+    getSpecTags: () => ['miner']
+  }
+  const thing = {
+    type: 'miner',
+    last: { snap: { success: true } },
+    info: {},
+    id: 'id1'
+  }
+  const result = processThingAlerts.call(mockWorker, thing)
+
+  t.is(result.length, 2)
+  t.is(result[0].message, 'TAG-A')
+  t.is(result[0].description, 'detailed A', 'per-match description used when provided')
+  t.is(result[1].message, 'TAG-B')
+  t.is(result[1].description, 'base description', 'falls back to config description')
+})
+
+test('wrk-fun-alerts: createdAt/uuid persist when only the description (reading) changes', async t => {
+  const prevUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+  const mockWorker = {
+    loadLib: () => ({
+      specs: {
+        miner: {
+          tag_warning: {
+            valid: () => true,
+            // Same tag, but the reading embedded in description has changed.
+            probe: () => [{ message: 'TAG-A', description: 'reading 321 (threshold 330)' }]
+          }
+        }
+      }
+    }),
+    conf: {
+      thing: {
+        alerts: {
+          miner: { tag_warning: { description: 'base', severity: 'warning' } }
+        }
+      }
+    },
+    getSpecTags: () => ['miner']
+  }
+  const thing = {
+    type: 'miner',
+    last: {
+      snap: { success: true },
+      alerts: [{
+        name: 'tag_warning',
+        message: 'TAG-A',
+        description: 'reading 305 (threshold 330)', // older reading
+        createdAt: 4242,
+        uuid: prevUuid
+      }]
+    },
+    info: {},
+    id: 'id1'
+  }
+  const result = processThingAlerts.call(mockWorker, thing)
+
+  t.is(result.length, 1)
+  t.is(result[0].description, 'reading 321 (threshold 330)', 'description reflects the new reading')
+  t.is(result[0].createdAt, 4242, 'createdAt pinned to when the condition first appeared')
+  t.is(result[0].uuid, prevUuid, 'uuid preserved across the changing reading')
+})
