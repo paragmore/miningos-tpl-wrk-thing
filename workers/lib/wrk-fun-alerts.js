@@ -25,7 +25,10 @@ const createAlert = ({
 const updateExistingAlerts = (alerts, alertsPrev) => {
   if (!Array.isArray(alertsPrev)) return
   alerts.forEach(alert => {
-    const alertExists = alertsPrev.find(val => val.name === alert.name && val.description === alert.description && val.message === alert.message)
+    // Match on the stable identity (alert name + message, e.g. the device tag)
+    // so createdAt/uuid persist across snaps even when `description` carries a
+    // fluctuating reading.
+    const alertExists = alertsPrev.find(val => val.name === alert.name && val.message === alert.message)
     alert.createdAt = alertExists?.createdAt ?? alert.createdAt
     alert.uuid = alertExists?.uuid ?? alert.uuid
   })
@@ -134,15 +137,25 @@ function processThingAlerts (thg) {
 
       if (at) {
         const alertConf = alertsFromConfig[ak]
-        const alert = createAlert({
-          name: alertConf?.name || ak,
-          code: alertConf?.code || ak,
-          description: alertConf?.description || ak,
-          severity: alertConf?.severity || 'medium',
-          createdAt: Date.now()
-        })
+        // A probe may return `true` (single alert, legacy) or an array of
+        // matches — one alert per match, with per-match detail (e.g. the device
+        // tag) carried in `message`. An empty array means no breach.
+        const matches = Array.isArray(at) ? at : [undefined]
 
-        acc.push(alert)
+        matches.forEach(match => {
+          const isObj = match && typeof match === 'object'
+          const message = typeof match === 'string' ? match : (isObj ? match.message : undefined)
+          const description = (isObj && match.description) || alertConf?.description || ak
+
+          acc.push(createAlert({
+            name: alertConf?.name || ak,
+            code: alertConf?.code || ak,
+            description,
+            severity: alertConf?.severity || 'medium',
+            createdAt: Date.now(),
+            message
+          }))
+        })
       }
     })
   })
