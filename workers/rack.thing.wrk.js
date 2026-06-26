@@ -1075,6 +1075,7 @@ class WrkProcVar extends TetherWrkBase {
    * @param {number} [req.limit=100] - Maximum entries to return
    * @param {number} [req.start] - Start timestamp for time range filter
    * @param {number} [req.end] - End timestamp for time range filter
+   * @param {Object} [req.query] - MongoDB-style query filter applied to results
    * @param {Object} [req.fields] - Field projection (for 'info' type only)
    * @returns {Promise<Array>} Array of historical log entries with associated thing info
    * @throws {Error} ERR_INFO_HISTORY_LOG_TYPE_INVALID - logType parameter missing or invalid
@@ -1085,12 +1086,15 @@ class WrkProcVar extends TetherWrkBase {
       throw new Error('ERR_INFO_HISTORY_LOG_TYPE_INVALID')
     }
     if (logType === 'alerts') {
-      return this._getLogs(
+      const logs = await this._getLogs(
         req,
         'thing-alerts',
         'ERR_LOG_NOTFOUND',
         this._transformAlerts.bind(this)
       )
+      // Filter at the rack (e.g. by thing.type); sort/pagination stay with the caller.
+      if (gLibUtilBase.isNil(req.query)) return logs
+      return this._applyFilters(logs, { query: req.query }, true)
     }
     if (logType === 'info') {
       const logs = await this._getLogs(
