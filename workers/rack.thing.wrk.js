@@ -13,6 +13,7 @@ const lWrkFunStats = require('./lib/wrk-fun-stats')
 const lWrkFunAlerts = require('./lib/wrk-fun-alerts')
 const lWrkFunLogs = require('./lib/wrk-fun-logs')
 const lWrkFunRollups = require('./lib/wrk-fun-rollups')
+const lWrkFunWindows = require('./lib/wrk-fun-windows')
 const lWrkFunReplica = require('./lib/wrk-fun-replica')
 const lWrkFunSettings = require('./lib/wrk-fun-settings')
 const { exit } = require('node:process')
@@ -248,6 +249,11 @@ class WrkProcVar extends TetherWrkBase {
     )
     await this.collectSnapsHook0()
     try {
+      await lWrkFunWindows.collectWindowSamples.call(this, Date.now())
+    } catch (err) {
+      this.debugError('ERR_COLLECT_WINDOW_SAMPLES', err)
+    }
+    try {
       await this._saveAlerts()
     } catch (err) {
       this.debugError('ERR_SAVE_ALERTS', err)
@@ -399,6 +405,10 @@ class WrkProcVar extends TetherWrkBase {
 
   async collectSnapsHook0 () {
     // no-op
+  }
+
+  getWindowSample (spec, thgIds) {
+    return lWrkFunWindows.sampleWindowFields.call(this, spec, thgIds)
   }
 
   async setupThing (base) {
@@ -1456,7 +1466,8 @@ class WrkProcVar extends TetherWrkBase {
       start,
       end,
       key,
-      timeframes
+      timeframes,
+      this.windowLogIntervalsMs
     )
     const logMaxHeight = getLogMaxHeight(this.conf.thing.logKeepCount)
 
@@ -1806,6 +1817,9 @@ class WrkProcVar extends TetherWrkBase {
         if (Array.isArray(this.scheduleAddlStatConfigTfs)) {
           this.statTimeframes = this.statTimeframes.concat(this.scheduleAddlStatConfigTfs)
         }
+
+        this.windowLogSpecs = lWrkFunWindows.getValidWindowSpecs(thingConf.windowLogs)
+        this.windowLogIntervalsMs = lWrkFunWindows.getWindowIntervalsMs(this.windowLogSpecs)
 
         await this.net_r0.startRpcServer()
         const rpcServer = this.net_r0.rpcServer

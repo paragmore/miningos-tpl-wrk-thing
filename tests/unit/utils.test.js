@@ -82,6 +82,17 @@ test('getLogsCountForTimeRange: hour-style cron uses hour interval', async t => 
   t.ok(result >= 3)
 })
 
+test('getLogsCountForTimeRange: seconds cron uses seconds interval', async t => {
+  const result = getLogsCountForTimeRange(0, 60 * 1000, 'stat-10s', [['10s', '*/10 * * * * *']])
+  t.is(result, 7)
+})
+
+test('getLogsCountForTimeRange: explicit log intervals take precedence', async t => {
+  const result = getLogsCountForTimeRange(0, 60 * 1000, 'power-10s', DEFAULT_TIMEFRAMES, { 'power-10s': 10000 })
+  t.is(result, 7)
+  t.is(getLogsCountForTimeRange(0, 60 * 1000, 'other', DEFAULT_TIMEFRAMES, { 'power-10s': 10000 }), 0)
+})
+
 test('getLogsCountForTimeRange: daily cron and unsupported cron return 0', async t => {
   const daily = getLogsCountForTimeRange(
     0,
