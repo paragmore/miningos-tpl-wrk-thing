@@ -37,20 +37,18 @@ test('lib:wrk-fun-windows buildWindowEntry', async t => {
     window_ms: 10000,
     window_samples: 3,
     site_power_w_avg: null,
-    site_power_w_min: null,
-    site_power_w_max: null,
     site_power_w_count: 0
   })
 
   const full = buildWindowEntry({
     start: 20000,
     samples: 2,
-    fields: { site_power_w: { sum: 30, min: 10, max: 20, count: 2 } }
+    fields: { site_power_w: { sum: 30, count: 2 } }
   }, SPEC)
   t.is(full.site_power_w_avg, 15)
-  t.is(full.site_power_w_min, 10)
-  t.is(full.site_power_w_max, 20)
   t.is(full.site_power_w_count, 2)
+  t.absent('site_power_w_min' in full)
+  t.absent('site_power_w_max' in full)
 })
 
 test('lib:wrk-fun-windows sampleWindowFields skips unhealthy things', async t => {
@@ -143,8 +141,6 @@ test('lib:wrk-fun-windows collectWindowSamples', async (main) => {
       window_ms: 10000,
       window_samples: 3,
       site_power_w_avg: 7,
-      site_power_w_min: 4,
-      site_power_w_max: 10,
       site_power_w_count: 2
     })
   })

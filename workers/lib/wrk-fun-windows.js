@@ -101,18 +101,9 @@ function addSample (win, spec, sample) {
       continue
     }
 
-    const acc = win.fields[field]
-
-    if (!acc) {
-      win.fields[field] = { sum: val, min: val, max: val, count: 1 }
-      continue
-    }
-
+    const acc = win.fields[field] || (win.fields[field] = { sum: 0, count: 0 })
     acc.sum += val
     acc.count++
-
-    if (val < acc.min) acc.min = val
-    if (val > acc.max) acc.max = val
   }
 }
 
@@ -127,8 +118,6 @@ function buildWindowEntry (win, spec) {
     const acc = win.fields[field]
 
     data[`${field}_avg`] = acc ? acc.sum / acc.count : null
-    data[`${field}_min`] = acc ? acc.min : null
-    data[`${field}_max`] = acc ? acc.max : null
     data[`${field}_count`] = acc ? acc.count : 0
   }
 
