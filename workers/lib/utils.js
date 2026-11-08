@@ -16,7 +16,11 @@ const isOffline = (snap) => {
  * @returns {number} The interval in milliseconds.
  */
 const getIntervalFromCron = (cron) => {
-  const [, minute, hour] = cron.split(' ')
+  const [second, minute, hour] = cron.split(' ')
+
+  if (second?.startsWith('*/') && minute === '*') {
+    return parseInt(second.slice(2), 10) * 1000
+  }
 
   if (minute.startsWith('*/')) {
     return parseInt(minute.slice(2), 10) * 60 * 1000
@@ -32,9 +36,12 @@ const getIntervalFromCron = (cron) => {
   throw new Error('ERR_CRON_UNSUPPORTED')
 }
 
-const getLogsCountForTimeRange = (start, end, key, statTimeframes) => {
+const getLogsCountForTimeRange = (start, end, key, statTimeframes, logIntervalsMs) => {
   end ||= Date.now()
   start ??= 0
+  if (logIntervalsMs?.[key]) {
+    return Math.ceil((end - start) / logIntervalsMs[key]) + 1
+  }
   if (!statTimeframes) return 0
   const currentLogCron = statTimeframes.find(
     tf => tf[0] === key.replace('stat-', '')
