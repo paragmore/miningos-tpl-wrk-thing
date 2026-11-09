@@ -87,7 +87,6 @@ class WrkProcVar extends TetherWrkBase {
     this.rackId = `${this.getThingType()}-${ctx.rack}`
 
     this.setInitFacs([
-      ['fac', '@bitfinex/bfx-facs-interval', '0', '0', {}, -10],
       ['fac', '@bitfinex/bfx-facs-scheduler', '0', '0', {}, -10],
       ['fac', '@tetherto/hp-svc-facs-store', 's1', 's1', {
         storePrimaryKey: this.ctx.storePrimaryKey,
